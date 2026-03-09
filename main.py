@@ -65,12 +65,17 @@ Received: {email_data['received_at'].strftime('%Y-%m-%d %H:%M:%S')}
 
 
 # Configuration
+# Railway provides PORT env var - use it if available
+WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8000")))
 SMTP_HOST = os.getenv("SMTP_HOST", "0.0.0.0")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "2525"))
-WEB_PORT = int(os.getenv("WEB_PORT", "8000"))
 DOMAIN = os.getenv("DOMAIN", "localhost")
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
 MAX_EMAIL_AGE_HOURS = int(os.getenv("MAX_EMAIL_AGE_HOURS", "24"))
 FORWARD_VERIFICATION_EXPIRY_HOURS = int(os.getenv("FORWARD_VERIFICATION_EXPIRY_HOURS", "24"))
+
+# Production mode detection
+IS_PRODUCTION = os.getenv("RAILWAY_ENVIRONMENT") == "production" or os.getenv("PRODUCTION") == "true"
 
 # Data storage (in-memory with simple persistence)
 # In production, use Redis or a proper database
@@ -333,6 +338,42 @@ async def get_stats():
         "total_emails": total_emails,
         "forwarded_emails": forwarded_emails,
     }
+
+
+@app.post("/api/inbox/{inbox_name}/receive")
+async def receive_email_api(
+    inbox_name: str,
+    from_address: str = Form(...),
+    subject: str = Form(""),
+    body: str = Form(""),
+    html_body: Optional[str] = Form(None),
+):
+    """Receive an email via API (for production where SMTP may not be available)"""
+    inbox = inbox_name.lower()
+
+    email_id = str(uuid.uuid4())
+    email_data = {
+        "id": email_id,
+        "from_address": from_address,
+        "to_address": f"{inbox}@{DOMAIN}",
+        "subject": subject,
+        "body": body,
+        "html_body": html_body,
+        "received_at": datetime.now(),
+        "forwarded": False,
+    }
+
+    if inbox not in emails:
+        emails[inbox] = []
+    emails[inbox].insert(0, email_data)
+
+    return {"status": "received", "email_id": email_id, "inbox": inbox}
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Railway"""
+    return {"status": "healthy", "service": "disposable-email"}
 
 
 # Create HTML templates
@@ -649,17 +690,27 @@ async def main():
     # Create templates
     create_templates()
 
-    # Start SMTP server
-    handler = EmailHandler()
-    smtp_controller = Controller(handler, hostname=SMTP_HOST, port=SMTP_PORT)
-    smtp_controller.start()
-    print(f"\nSMTP Server running on {SMTP_HOST}:{SMTP_PORT}")
-    print(f"Send emails to: anything@{DOMAIN}")
+    # Determine public domain for display
+    public_domain = RAILWAY_STATIC_URL.replace("https://", "").replace("http://", "") if RAILWAY_STATIC_URL else DOMAIN
+
+    # Start SMTP server (if not disabled)
+    smtp_controller = None
+    if not IS_PRODUCTION:
+        handler = EmailHandler()
+        smtp_controller = Controller(handler, hostname=SMTP_HOST, port=SMTP_PORT)
+        smtp_controller.start()
+        print(f"\nSMTP Server running on {SMTP_HOST}:{SMTP_PORT}")
+        print(f"Send emails to: anything@{public_domain}")
+    else:
+        print("\n⚠️  SMTP Server disabled in production mode")
+        print("   Emails can only be received via API in production")
 
     # Start HTTP server
     import uvicorn
 
-    print(f"\nWeb UI: http://localhost:{WEB_PORT}")
+    print(f"\nWeb UI: http://0.0.0.0:{WEB_PORT}")
+    if public_domain and public_domain != "localhost":
+        print(f"Public URL: https://{public_domain}")
     print(f"Example inbox: http://localhost:{WEB_PORT}/inbox/test")
     print("\nPress Ctrl+C to stop\n")
 
@@ -668,7 +719,8 @@ async def main():
     await server.serve()
 
     # Cleanup
-    smtp_controller.stop()
+    if smtp_controller:
+        smtp_controller.stop()
 
 
 if __name__ == "__main__":
