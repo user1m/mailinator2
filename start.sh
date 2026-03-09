@@ -1,29 +1,27 @@
 #!/bin/bash
 
 # Start the Disposable Email Service with Forwarding
+# Uses uv (https://github.com/astral-sh/uv) for fast package management
 
 echo "Starting Disposable Email Service..."
 echo ""
 
-# Check if Python is installed
-if ! command -v python3 &> /dev/null; then
-    echo "Error: Python 3 is required but not installed."
+# Check if uv is installed
+if ! command -v uv &> /dev/null; then
+    echo "Error: uv is required but not installed."
+    echo "Install it with: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 
 # Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv venv
+if [ ! -d ".venv" ]; then
+    echo "Creating virtual environment with uv..."
+    uv venv
 fi
 
-# Activate virtual environment
-echo "Activating virtual environment..."
-source venv/bin/activate
-
 # Install dependencies
-echo "Installing dependencies..."
-pip install -q -r requirements.txt
+echo "Installing dependencies with uv..."
+uv pip install -r requirements.txt
 
 # Start the service
 echo ""
@@ -32,7 +30,4 @@ echo "Disposable Email Service is starting..."
 echo "============================================"
 echo ""
 
-python main.py
-
-# Deactivate on exit
-deactivate
+uv run python main.py
