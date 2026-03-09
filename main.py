@@ -5,9 +5,8 @@ A Mailinator-like service built with FastAPI and aiosmtpd
 
 import asyncio
 import email
-import hashlib
-import json
 import os
+import random
 import uuid
 from datetime import datetime, timedelta
 from email.message import EmailMessage as StdEmailMessage
@@ -16,10 +15,54 @@ from typing import Optional
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, EmailStr
+
+async def send_forward_email(target_email: str, email_data: dict, inbox: str):
+    """Send the forwarded email to the target address"""
+    import aiosmtplib
+
+    # Create forwarded email
+    msg = StdEmailMessage()
+    msg["From"] = f"forwarder@{DOMAIN}"
+    msg["To"] = target_email
+    msg["Subject"] = f"[Forwarded from {inbox}@{DOMAIN}] {email_data['subject']}"
+
+    # Build body with notice
+    forward_notice = f"""
+---
+This email was forwarded from disposable inbox: {inbox}@{DOMAIN}
+Original sender: {email_data['from_address']}
+Original recipient: {email_data['to_address']}
+Received: {email_data['received_at'].strftime('%Y-%m-%d %H:%M:%S')}
+---
+
+"""
+
+    if email_data.get("html_body"):
+        msg.add_alternative(
+            f"<html><body><p><em>{forward_notice.replace(chr(10), '<br>')}</em></p>{email_data['html_body']}</body></html>",
+            subtype="html",
+        )
+    else:
+        msg.set_content(forward_notice + email_data["body"])
+
+    # Send via local SMTP (you'd configure your SMTP server here)
+    # For now, just log it - configure with your SMTP credentials
+    print(f"Would forward to {target_email}:")
+    print(f"Subject: {msg['Subject']}")
+
+    # Example with aiosmtplib (configure with your SMTP server):
+    # await aiosmtplib.send(
+    #     msg,
+    #     hostname="smtp.gmail.com",
+    #     port=587,
+    #     username="your-email@gmail.com",
+    #     password="your-password",
+    #     start_tls=True,
+    # )
+
 
 # Configuration
 SMTP_HOST = os.getenv("SMTP_HOST", "0.0.0.0")
@@ -32,7 +75,10 @@ FORWARD_VERIFICATION_EXPIRY_HOURS = int(os.getenv("FORWARD_VERIFICATION_EXPIRY_H
 # Data storage (in-memory with simple persistence)
 # In production, use Redis or a proper database
 emails: dict[str, list[dict]] = {}  # inbox -> list of emails
-forward_rules: dict[str, dict] = {}  # inbox -> {target_email, verified, verification_token}
+
+# Per-email forward requests with verification codes
+# Key: f"{inbox}:{email_id}", Value: {target_email, verification_code, expires_at, verified}
+forward_requests: dict[str, dict] = {}
 
 app = FastAPI(title="Disposable Email Service")
 templates = Jinja2Templates(directory="templates")
@@ -50,11 +96,6 @@ class EmailData(BaseModel):
     html_body: Optional[str] = None
     received_at: datetime
     forwarded: bool = False
-
-
-class ForwardSetupRequest(BaseModel):
-    inbox: str
-    target_email: EmailStr
 
 
 # SMTP Handler
@@ -107,9 +148,6 @@ class EmailHandler:
             # Clean old emails
             await self._clean_old_emails(inbox)
 
-            # Check if forwarding is enabled for this inbox
-            await self._forward_email(inbox, email_data)
-
             print(f"Received email for {inbox}: {subject}")
             return "250 Message accepted for delivery"
 
@@ -123,62 +161,6 @@ class EmailHandler:
         if inbox in emails:
             emails[inbox] = [e for e in emails[inbox] if e["received_at"] > cutoff]
 
-    async def _forward_email(self, inbox: str, email_data: dict):
-        """Forward email if forwarding is configured and verified"""
-        if inbox in forward_rules:
-            rule = forward_rules[inbox]
-            if rule.get("verified") and rule.get("active"):
-                try:
-                    await self._send_forward_email(rule["target_email"], email_data, inbox)
-                    email_data["forwarded"] = True
-                    print(f"Forwarded email from {inbox} to {rule['target_email']}")
-                except Exception as e:
-                    print(f"Failed to forward email: {e}")
-
-    async def _send_forward_email(self, target_email: str, email_data: dict, inbox: str):
-        """Actually send the forwarded email"""
-        import aiosmtplib
-
-        # Create forwarded email
-        msg = StdEmailMessage()
-        msg["From"] = f"forwarder@{DOMAIN}"
-        msg["To"] = target_email
-        msg["Subject"] = f"[Forwarded from {inbox}@{DOMAIN}] {email_data['subject']}"
-
-        # Build body with notice
-        forward_notice = f"""
----
-This email was forwarded from disposable inbox: {inbox}@{DOMAIN}
-Original sender: {email_data['from_address']}
-Original recipient: {email_data['to_address']}
-Received: {email_data['received_at'].strftime('%Y-%m-%d %H:%M:%S')}
----
-
-"""
-
-        if email_data.get("html_body"):
-            msg.add_alternative(
-                f"<html><body><p><em>{forward_notice.replace(chr(10), '<br>')}</em></p>{email_data['html_body']}</body></html>",
-                subtype="html",
-            )
-        else:
-            msg.set_content(forward_notice + email_data["body"])
-
-        # Send via local SMTP (you'd configure your SMTP server here)
-        # For now, just log it - configure with your SMTP credentials
-        print(f"Would forward to {target_email}:")
-        print(f"Subject: {msg['Subject']}")
-
-        # Example with aiosmtplib (configure with your SMTP server):
-        # await aiosmtplib.send(
-        #     msg,
-        #     hostname="smtp.gmail.com",
-        #     port=587,
-        #     username="your-email@gmail.com",
-        #     password="your-password",
-        #     start_tls=True,
-        # )
-
 
 # Web Routes
 @app.get("/", response_class=HTMLResponse)
@@ -190,17 +172,16 @@ async def index(request: Request):
 @app.get("/inbox/{inbox_name}", response_class=HTMLResponse)
 async def view_inbox(request: Request, inbox_name: str):
     """View inbox contents"""
-    inbox_emails = emails.get(inbox_name.lower(), [])
-    forward_rule = forward_rules.get(inbox_name.lower())
+    inbox = inbox_name.lower()
+    inbox_emails = emails.get(inbox, [])
 
     return templates.TemplateResponse(
         "inbox.html",
         {
             "request": request,
-            "inbox": inbox_name.lower(),
+            "inbox": inbox,
             "emails": inbox_emails,
             "domain": DOMAIN,
-            "forward_rule": forward_rule,
         },
     )
 
@@ -208,106 +189,126 @@ async def view_inbox(request: Request, inbox_name: str):
 @app.get("/inbox/{inbox_name}/email/{email_id}", response_class=HTMLResponse)
 async def view_email(request: Request, inbox_name: str, email_id: str):
     """View a single email"""
-    inbox_emails = emails.get(inbox_name.lower(), [])
+    inbox = inbox_name.lower()
+    inbox_emails = emails.get(inbox, [])
     email_data = next((e for e in inbox_emails if e["id"] == email_id), None)
 
     if not email_data:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    # Check if there's a pending forward request for this email
+    request_key = f"{inbox}:{email_id}"
+    forward_request = forward_requests.get(request_key)
+
     return templates.TemplateResponse(
         "email.html",
-        {"request": request, "inbox": inbox_name.lower(), "email": email_data, "domain": DOMAIN},
+        {
+            "request": request,
+            "inbox": inbox,
+            "email": email_data,
+            "domain": DOMAIN,
+            "forward_request": forward_request,
+        },
     )
 
 
-@app.post("/api/inbox/{inbox_name}/forward")
-async def setup_forwarding(inbox_name: str, target_email: str = Form(...)):
-    """Set up email forwarding for an inbox (requires verification)"""
-    inbox = inbox_name.lower()
+def generate_verification_code() -> str:
+    """Generate a 6-digit verification code"""
+    import random
+    return ''.join(random.choices('0123456789', k=6))
 
-    # Generate verification token
-    verification_token = hashlib.sha256(f"{inbox}:{target_email}:{uuid.uuid4()}".encode()).hexdigest()
 
-    # Store forwarding rule (unverified)
-    forward_rules[inbox] = {
-        "target_email": target_email,
-        "verified": False,
-        "verification_token": verification_token,
-        "created_at": datetime.now(),
-        "expires_at": datetime.now() + timedelta(hours=FORWARD_VERIFICATION_EXPIRY_HOURS),
-        "active": False,
-    }
-
-    # Generate verification URL
-    verification_url = f"http://{DOMAIN}:{WEB_PORT}/verify/{inbox}/{verification_token}"
-
-    # In a real implementation, send this via email
-    # For now, return it in the response (for demo purposes)
+async def send_verification_email(target_email: str, code: str, email_subject: str):
+    """Send verification code to target email (logs to console for demo)"""
     print(f"\n{'='*60}")
-    print(f"VERIFICATION REQUIRED for {inbox}@{DOMAIN}")
-    print(f"Target email: {target_email}")
-    print(f"Verification URL: {verification_url}")
+    print(f"VERIFICATION CODE for {target_email}")
+    print(f"Code: {code}")
+    print(f"Email Subject: {email_subject}")
     print(f"{'='*60}\n")
+    # In production, actually send email via SMTP
+
+
+@app.post("/api/inbox/{inbox_name}/email/{email_id}/forward-request")
+async def request_email_forward(inbox_name: str, email_id: str, target_email: str = Form(...)):
+    """Request to forward a specific email - sends verification code"""
+    inbox = inbox_name.lower()
+
+    # Find the email
+    inbox_emails = emails.get(inbox, [])
+    email_data = next((e for e in inbox_emails if e["id"] == email_id), None)
+
+    if not email_data:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Generate verification code
+    verification_code = generate_verification_code()
+
+    # Store forward request
+    request_key = f"{inbox}:{email_id}"
+    forward_requests[request_key] = {
+        "target_email": target_email,
+        "verification_code": verification_code,
+        "created_at": datetime.now(),
+        "expires_at": datetime.now() + timedelta(minutes=15),  # 15 minute expiry
+        "verified": False,
+    }
+
+    # "Send" verification code
+    await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
 
     return {
-        "status": "pending_verification",
-        "message": "Please check your email and click the verification link to activate forwarding.",
-        "verification_url": verification_url,  # Remove in production - for demo only
+        "status": "verification_sent",
+        "message": f"A verification code has been sent to {target_email}. Please enter the code to complete forwarding.",
+        "demo_code": verification_code,  # Remove in production - for demo only
     }
 
 
-@app.get("/verify/{inbox}/{token}")
-async def verify_forwarding(inbox: str, token: str):
-    """Verify and activate email forwarding"""
-    inbox = inbox.lower()
-
-    if inbox not in forward_rules:
-        raise HTTPException(status_code=404, detail="Forwarding rule not found")
-
-    rule = forward_rules[inbox]
-
-    if rule["verification_token"] != token:
-        raise HTTPException(status_code=400, detail="Invalid verification token")
-
-    if datetime.now() > rule["expires_at"]:
-        raise HTTPException(status_code=400, detail="Verification link has expired")
-
-    if rule["verified"]:
-        return {"status": "already_verified", "message": "Forwarding is already active"}
-
-    # Activate forwarding
-    rule["verified"] = True
-    rule["active"] = True
-    rule["verified_at"] = datetime.now()
-
-    return {
-        "status": "verified",
-        "message": f"Email forwarding activated! Emails to {inbox}@{DOMAIN} will now be forwarded to {rule['target_email']}",
-    }
-
-
-@app.post("/api/inbox/{inbox_name}/forward/disable")
-async def disable_forwarding(inbox_name: str):
-    """Disable email forwarding for an inbox"""
+@app.post("/api/inbox/{inbox_name}/email/{email_id}/forward-verify")
+async def verify_and_forward_email(
+    inbox_name: str,
+    email_id: str,
+    verification_code: str = Form(...),
+    target_email: str = Form(...)
+):
+    """Verify the code and forward the email"""
     inbox = inbox_name.lower()
+    request_key = f"{inbox}:{email_id}"
 
-    if inbox in forward_rules:
-        forward_rules[inbox]["active"] = False
-        return {"status": "disabled", "message": "Email forwarding has been disabled"}
+    if request_key not in forward_requests:
+        raise HTTPException(status_code=404, detail="Forward request not found. Please request forwarding again.")
 
-    raise HTTPException(status_code=404, detail="No forwarding rule found")
+    request = forward_requests[request_key]
 
+    # Check expiry
+    if datetime.now() > request["expires_at"]:
+        del forward_requests[request_key]
+        raise HTTPException(status_code=400, detail="Verification code has expired. Please request forwarding again.")
 
-@app.post("/api/inbox/{inbox_name}/forward/delete")
-async def delete_forwarding(inbox_name: str):
-    """Delete email forwarding rule for an inbox (POST for HTML form support)"""
-    inbox = inbox_name.lower()
+    # Verify code
+    if request["verification_code"] != verification_code:
+        raise HTTPException(status_code=400, detail="Invalid verification code. Please try again.")
 
-    if inbox in forward_rules:
-        del forward_rules[inbox]
-        return RedirectResponse(url=f"/inbox/{inbox}", status_code=303)
+    # Find the email
+    inbox_emails = emails.get(inbox, [])
+    email_data = next((e for e in inbox_emails if e["id"] == email_id), None)
 
-    raise HTTPException(status_code=404, detail="No forwarding rule found")
+    if not email_data:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Forward the email
+    try:
+        await send_forward_email(target_email, email_data, inbox)
+        email_data["forwarded"] = True
+
+        # Clean up the request
+        del forward_requests[request_key]
+
+        return {
+            "status": "forwarded",
+            "message": f"Email successfully forwarded to {target_email}",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to forward email: {str(e)}")
 
 
 @app.get("/api/inbox/{inbox_name}/emails")
@@ -322,12 +323,15 @@ async def get_stats():
     """Get service statistics"""
     total_inboxes = len(emails)
     total_emails = sum(len(inbox_emails) for inbox_emails in emails.values())
-    active_forward_rules = sum(1 for rule in forward_rules.values() if rule.get("active"))
+    forwarded_emails = sum(
+        sum(1 for e in inbox_emails if e.get("forwarded"))
+        for inbox_emails in emails.values()
+    )
 
     return {
         "total_inboxes": total_inboxes,
         "total_emails": total_emails,
-        "active_forward_rules": active_forward_rules,
+        "forwarded_emails": forwarded_emails,
     }
 
 
@@ -508,41 +512,6 @@ function goToInbox(event) {
 <div class="container">
     <a href="/" class="btn" style="margin-bottom: 20px;">← Back to Home</a>
 
-    <!-- Forwarding Section -->
-    <div class="card">
-        <h3>Email Forwarding</h3>
-
-        {% if forward_rule and forward_rule.verified and forward_rule.active %}
-            <div class="alert alert-success">
-                <strong>Forwarding Active</strong><br>
-                Emails are being forwarded to: {{ forward_rule.target_email }}
-            </div>
-            <form action="/api/inbox/{{ inbox }}/forward/disable" method="post" style="display: inline;">
-                <button type="submit" class="btn btn-danger">Disable Forwarding</button>
-            </form>
-            <form action="/api/inbox/{{ inbox }}/forward/delete" method="post" style="display: inline; margin-left: 10px;">
-                <button type="submit" class="btn btn-danger">Remove Forwarding Rule</button>
-            </form>
-
-        {% elif forward_rule and not forward_rule.verified %}
-            <div class="alert alert-warning">
-                <strong>Verification Pending</strong><br>
-                Please check {{ forward_rule.target_email }} and click the verification link to activate forwarding.
-                <br><small>Link expires in 24 hours</small>
-            </div>
-
-        {% else %}
-            <p>Forward emails from this inbox to your real email address:</p>
-            <form action="/api/inbox/{{ inbox }}/forward" method="post" class="forward-form">
-                <input type="email" name="target_email" placeholder="your-real-email@example.com" required>
-                <button type="submit" class="btn btn-secondary">Set Up Forwarding</button>
-            </form>
-            <p style="margin-top: 10px; font-size: 14px; color: #718096;">
-                You'll need to verify your email address before forwarding begins.
-            </p>
-        {% endif %}
-    </div>
-
     <!-- Email List -->
     <div class="card">
         <h3>Inbox Contents</h3>
@@ -603,6 +572,46 @@ function goToInbox(event) {
                 <span class="badge badge-success">Forwarded</span>
             {% endif %}
         </div>
+
+        <!-- Forward Email Section -->
+        {% if not email.forwarded %}
+        <div class="card" style="background: #f0fff4; border: 1px solid #9ae6b4;">
+            <h3>Forward This Email</h3>
+
+            {% if forward_request and not forward_request.verified %}
+                <div class="alert alert-info">
+                    <strong>Verification Required</strong><br>
+                    A 6-digit verification code has been sent to <strong>{{ forward_request.target_email }}</strong>.<br>
+                    <small>Code expires in 15 minutes.</small>
+                </div>
+
+                <form action="/api/inbox/{{ inbox }}/email/{{ email.id }}/forward-verify" method="post">
+                    <input type="hidden" name="target_email" value="{{ forward_request.target_email }}">
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
+                        <div style="flex: 1; min-width: 200px;">
+                            <label style="display: block; margin-bottom: 5px; font-weight: 600;">Verification Code</label>
+                            <input type="text" name="verification_code" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required style="margin-bottom: 0;">
+                        </div>
+                        <button type="submit" class="btn btn-secondary">Verify & Forward</button>
+                    </div>
+                </form>
+
+            {% else %}
+                <p>Send this email to your personal inbox:</p>
+                <form action="/api/inbox/{{ inbox }}/email/{{ email.id }}/forward-request" method="post" class="forward-form">
+                    <input type="email" name="target_email" placeholder="your-email@example.com" required>
+                    <button type="submit" class="btn btn-secondary">Send Verification Code</button>
+                </form>
+                <p style="margin-top: 10px; font-size: 14px; color: #718096;">
+                    You'll receive a 6-digit verification code. Forwarding only happens after verification.
+                </p>
+            {% endif %}
+        </div>
+        {% else %}
+        <div class="alert alert-success">
+            <strong>This email has been forwarded.</strong>
+        </div>
+        {% endif %}
 
         <div class="email-body">
             {% if email.html_body %}
