@@ -14,10 +14,14 @@ from typing import Optional
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from dotenv import load_dotenv
+from fastapi import FastAPI, Form, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, EmailStr
+
+# Load environment variables from .env file
+load_dotenv()
 
 async def send_forward_email(target_email: str, email_data: dict, inbox: str):
     """Send the forwarded email to the target address"""
@@ -76,6 +80,11 @@ FORWARD_VERIFICATION_EXPIRY_HOURS = int(os.getenv("FORWARD_VERIFICATION_EXPIRY_H
 
 # Production mode detection
 IS_PRODUCTION = os.getenv("RAILWAY_ENVIRONMENT") == "production" or os.getenv("PRODUCTION") == "true"
+
+# Resend Configuration
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
+RESEND_DOMAIN = os.getenv("RESEND_DOMAIN", DOMAIN)  # Domain configured in Resend
 
 # Data storage (in-memory with simple persistence)
 # In production, use Redis or a proper database
@@ -171,7 +180,14 @@ class EmailHandler:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Home page"""
-    return templates.TemplateResponse("index.html", {"request": request, "domain": DOMAIN})
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "domain": DOMAIN,
+            "resend_domain": RESEND_DOMAIN if RESEND_API_KEY else None,
+        }
+    )
 
 
 @app.get("/inbox/{inbox_name}", response_class=HTMLResponse)
@@ -376,6 +392,81 @@ async def health_check():
     return {"status": "healthy", "service": "disposable-email"}
 
 
+@app.post("/api/webhooks/resend")
+async def resend_webhook(request: Request):
+    """Receive inbound emails from Resend"""
+    try:
+        payload = await request.json()
+
+        # Verify webhook secret if configured
+        # Note: Resend doesn't have built-in webhook signature verification yet,
+        # but you can add a simple secret check in the URL or header
+
+        # Extract email data from Resend payload
+        # Resend inbound webhook format:
+        # {
+        #   "from": "sender@example.com",
+        #   "to": ["inbox@yourdomain.com"],
+        #   "subject": "Email subject",
+        #   "text": "Plain text body",
+        #   "html": "<html>HTML body</html>",
+        #   "attachments": [...]
+        # }
+
+        from_address = payload.get("from", "")
+        to_addresses = payload.get("to", [])
+        subject = payload.get("subject", "")
+        body = payload.get("text", "")
+        html_body = payload.get("html", None)
+
+        # Extract inbox from first to_address
+        inbox = "unknown"
+        if to_addresses and len(to_addresses) > 0:
+            to_address = to_addresses[0]
+            inbox = to_address.split("@")[0].lower() if "@" in to_address else to_address.lower()
+
+        # Create email record
+        email_id = str(uuid.uuid4())
+        email_data = {
+            "id": email_id,
+            "from_address": from_address,
+            "to_address": to_addresses[0] if to_addresses else "",
+            "subject": subject,
+            "body": body,
+            "html_body": html_body,
+            "received_at": datetime.now(),
+            "forwarded": False,
+            "source": "resend",  # Track that it came via Resend
+        }
+
+        # Store email
+        if inbox not in emails:
+            emails[inbox] = []
+        emails[inbox].insert(0, email_data)
+
+        print(f"📧 Received email via Resend for inbox '{inbox}': {subject}")
+
+        return JSONResponse(
+            status_code=200,
+            content={"status": "received", "email_id": email_id, "inbox": inbox}
+        )
+
+    except Exception as e:
+        print(f"Error processing Resend webhook: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid webhook payload: {str(e)}")
+
+
+@app.get("/api/resend/status")
+async def resend_status():
+    """Check Resend integration status"""
+    return {
+        "configured": bool(RESEND_API_KEY),
+        "domain": RESEND_DOMAIN,
+        "webhook_url": f"https://{DOMAIN}/api/webhooks/resend",
+        "instructions": "Configure this webhook URL in your Resend dashboard under Inbound Emails"
+    }
+
+
 # Create HTML templates
 def create_templates():
     """Create HTML template files"""
@@ -515,6 +606,11 @@ def create_templates():
         <p style="margin-top: 15px; color: #718096;">
             Your inbox will be: <strong>your-inbox-name@{{ domain }}</strong>
         </p>
+        {% if resend_domain %}
+        <p style="margin-top: 10px; color: #48bb78; font-size: 14px;">
+            <strong>✓ Resend configured:</strong> Emails to <code>*@{{ resend_domain }}</code> will be received
+        </p>
+        {% endif %}
     </div>
 
     <div class="card">
