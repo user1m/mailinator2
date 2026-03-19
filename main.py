@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage as StdEmailMessage
 from typing import Optional
 import html
+import logging
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP
@@ -87,6 +88,7 @@ IS_PRODUCTION = os.getenv("RAILWAY_ENVIRONMENT") == "production" or os.getenv("P
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
 RESEND_DOMAIN = os.getenv("RESEND_DOMAIN", DOMAIN)  # Domain configured in Resend
+RESEND_VERIFICATION_SENDER = os.getenv("RESEND_VERIFICATION_SENDER", "onboarding@resend.dev")  # Sender for verification emails
 
 # Data storage (in-memory with simple persistence)
 # In production, use Redis or a proper database
@@ -253,8 +255,8 @@ def generate_verification_code() -> str:
     return ''.join(random.choices('0123456789', k=6))
 
 
-async def send_verification_email(target_email: str, code: str, email_subject: str):
-    """Send verification code to target email via Resend"""
+async def send_verification_email(target_email: str, code: str, email_subject: str) -> tuple[bool, str]:
+    """Send verification code to target email via Resend. Returns (success, error_message)."""
     import resend
 
     if not RESEND_API_KEY:
@@ -264,7 +266,7 @@ async def send_verification_email(target_email: str, code: str, email_subject: s
         print(f"Code: {code}")
         print(f"Email Subject: {email_subject}")
         print(f"{'='*60}\n")
-        return
+        return True, ""
 
     try:
         resend.api_key = RESEND_API_KEY
@@ -319,8 +321,11 @@ This code expires in 15 minutes.
 If you didn't request this, please ignore this email.
 """
 
+        # Use configured sender or default to Resend's onboarding address
+        sender = RESEND_VERIFICATION_SENDER
+
         params = {
-            "from": f"verify@{RESEND_DOMAIN}",
+            "from": sender,
             "to": [target_email],
             "subject": f"Verification Code: {code}",
             "html": html_content,
@@ -329,10 +334,12 @@ If you didn't request this, please ignore this email.
 
         result = resend.Emails.send(params)
         print(f"✓ Verification email sent to {target_email}: {result}")
+        return True, ""
 
     except Exception as e:
-        print(f"✗ Failed to send verification email: {e}")
-        # Don't raise - let the user know in the UI that email sending failed
+        error_msg = str(e)
+        print(f"✗ Failed to send verification email: {error_msg}")
+        return False, error_msg
 
 
 @app.post("/api/inbox/{inbox_name}/email/{email_id}/forward-request")
@@ -361,7 +368,32 @@ async def request_email_forward(inbox_name: str, email_id: str, target_email: st
     }
 
     # Send verification code via email
-    await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
+    success, error_msg = await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
+
+    if not success:
+        # Clean up the stored forward request on failure to avoid stale verification codes
+        if request_key in forward_requests:
+            del forward_requests[request_key]
+        # Log detailed error and show a generic message if sending failed
+        correlation_id = str(uuid.uuid4())
+        logging.error(
+            "Failed to send verification email (correlation_id=%s): %s",
+            correlation_id,
+            error_msg,
+        )
+        message = (
+            "Failed to send verification email. "
+            "Please try again later or contact support with this code: "
+            f"{correlation_id}"
+        )
+        redirect_url = URL(f"/inbox/{inbox}/email/{email_id}").include_query_params(
+            message=message,
+            type="error",
+        )
+        return RedirectResponse(
+            url=str(redirect_url),
+            status_code=303
+        )
 
     # Redirect back to email view with success message
     message = f"A verification code has been sent to {target_email}. Please check your inbox and enter the code below."
