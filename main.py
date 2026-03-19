@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from email.message import EmailMessage as StdEmailMessage
 from typing import Optional
+import html
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP
@@ -19,6 +20,7 @@ from fastapi import FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, EmailStr
+from starlette.datastructures import URL
 
 # Load environment variables from .env file
 load_dotenv()
@@ -208,7 +210,13 @@ async def view_inbox(request: Request, inbox_name: str):
 
 
 @app.get("/inbox/{inbox_name}/email/{email_id}", response_class=HTMLResponse)
-async def view_email(request: Request, inbox_name: str, email_id: str):
+async def view_email(
+    request: Request,
+    inbox_name: str,
+    email_id: str,
+    message: str = "",
+    message_type: str = "info",
+):
     """View a single email"""
     inbox = inbox_name.lower()
     inbox_emails = emails.get(inbox, [])
@@ -216,6 +224,10 @@ async def view_email(request: Request, inbox_name: str, email_id: str):
 
     if not email_data:
         raise HTTPException(status_code=404, detail="Email not found")
+
+    # Preserve backward compatibility for legacy `?type=` query parameter
+    if "type" in request.query_params and message_type == "info":
+        message_type = request.query_params["type"]
 
     # Check if there's a pending forward request for this email
     request_key = f"{inbox}:{email_id}"
@@ -229,6 +241,8 @@ async def view_email(request: Request, inbox_name: str, email_id: str):
             "email": email_data,
             "domain": DOMAIN,
             "forward_request": forward_request,
+            "message": message,
+            "message_type": message_type,
         },
     )
 
@@ -240,13 +254,85 @@ def generate_verification_code() -> str:
 
 
 async def send_verification_email(target_email: str, code: str, email_subject: str):
-    """Send verification code to target email (logs to console for demo)"""
-    print(f"\n{'='*60}")
-    print(f"VERIFICATION CODE for {target_email}")
-    print(f"Code: {code}")
-    print(f"Email Subject: {email_subject}")
-    print(f"{'='*60}\n")
-    # In production, actually send email via SMTP
+    """Send verification code to target email via Resend"""
+    import resend
+
+    if not RESEND_API_KEY:
+        # Fallback to console for development
+        print(f"\n{'='*60}")
+        print(f"VERIFICATION CODE for {target_email}")
+        print(f"Code: {code}")
+        print(f"Email Subject: {email_subject}")
+        print(f"{'='*60}\n")
+        return
+
+    try:
+        resend.api_key = RESEND_API_KEY
+
+        # Build email content
+        safe_subject = html.escape(email_subject) if email_subject else "(No Subject)"
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                    <h2 style="color: #667eea;">Email Forwarding Verification</h2>
+
+                    <p>You requested to forward an email to this address.</p>
+
+                    <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                        <p style="margin: 0; font-size: 14px; color: #666;">Original email subject:</p>
+                        <p style="margin: 5px 0 0 0; font-weight: bold;">{safe_subject}</p>
+                    </div>
+
+                    <p>Enter this verification code to complete the forwarding:</p>
+
+                    <div style="background: #667eea; color: white; padding: 20px; border-radius: 8px; text-align: center; margin: 20px 0;">
+                        <p style="margin: 0; font-size: 14px; opacity: 0.9;">Verification Code</p>
+                        <p style="margin: 10px 0 0 0; font-size: 32px; font-weight: bold; letter-spacing: 8px;">{code}</p>
+                    </div>
+
+                    <p style="color: #666; font-size: 14px;">
+                        This code expires in 15 minutes.<br>
+                        If you didn't request this, please ignore this email.
+                    </p>
+
+                    <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+
+                    <p style="color: #999; font-size: 12px;">
+                        Sent by Disposable Email Service
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+
+        text_content = f"""
+Email Forwarding Verification
+
+You requested to forward an email with subject: {email_subject or "(No Subject)"}
+
+Enter this verification code to complete the forwarding:
+
+    {code}
+
+This code expires in 15 minutes.
+If you didn't request this, please ignore this email.
+"""
+
+        params = {
+            "from": f"verify@{RESEND_DOMAIN}",
+            "to": [target_email],
+            "subject": f"Verification Code: {code}",
+            "html": html_content,
+            "text": text_content,
+        }
+
+        result = resend.Emails.send(params)
+        print(f"✓ Verification email sent to {target_email}: {result}")
+
+    except Exception as e:
+        print(f"✗ Failed to send verification email: {e}")
+        # Don't raise - let the user know in the UI that email sending failed
 
 
 @app.post("/api/inbox/{inbox_name}/email/{email_id}/forward-request")
@@ -274,14 +360,19 @@ async def request_email_forward(inbox_name: str, email_id: str, target_email: st
         "verified": False,
     }
 
-    # "Send" verification code
+    # Send verification code via email
     await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
 
-    return {
-        "status": "verification_sent",
-        "message": f"A verification code has been sent to {target_email}. Please enter the code to complete forwarding.",
-        "demo_code": verification_code,  # Remove in production - for demo only
-    }
+    # Redirect back to email view with success message
+    message = f"A verification code has been sent to {target_email}. Please check your inbox and enter the code below."
+    redirect_url = URL(f"/inbox/{inbox}/email/{email_id}").include_query_params(
+        message=message,
+        type="success",
+    )
+    return RedirectResponse(
+        url=str(redirect_url),
+        status_code=303
+    )
 
 
 @app.post("/api/inbox/{inbox_name}/email/{email_id}/forward-verify")
@@ -295,26 +386,43 @@ async def verify_and_forward_email(
     inbox = inbox_name.lower()
     request_key = f"{inbox}:{email_id}"
 
+    # Check if forward request exists
     if request_key not in forward_requests:
-        raise HTTPException(status_code=404, detail="Forward request not found. Please request forwarding again.")
+        message = "Forward request not found. Please request forwarding again."
+        return RedirectResponse(
+            url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=error",
+            status_code=303
+        )
 
     request = forward_requests[request_key]
 
     # Check expiry
     if datetime.now() > request["expires_at"]:
         del forward_requests[request_key]
-        raise HTTPException(status_code=400, detail="Verification code has expired. Please request forwarding again.")
+        message = "Verification code has expired. Please request forwarding again."
+        return RedirectResponse(
+            url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=error",
+            status_code=303
+        )
 
     # Verify code
     if request["verification_code"] != verification_code:
-        raise HTTPException(status_code=400, detail="Invalid verification code. Please try again.")
+        message = "Invalid verification code. Please try again."
+        return RedirectResponse(
+            url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=error",
+            status_code=303
+        )
 
     # Find the email
     inbox_emails = emails.get(inbox, [])
     email_data = next((e for e in inbox_emails if e["id"] == email_id), None)
 
     if not email_data:
-        raise HTTPException(status_code=404, detail="Email not found")
+        message = "Email not found."
+        return RedirectResponse(
+            url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=error",
+            status_code=303
+        )
 
     # Forward the email
     try:
@@ -324,12 +432,18 @@ async def verify_and_forward_email(
         # Clean up the request
         del forward_requests[request_key]
 
-        return {
-            "status": "forwarded",
-            "message": f"Email successfully forwarded to {target_email}",
-        }
+        # Redirect with success message
+        message = f"✓ Email successfully forwarded to {target_email}"
+        return RedirectResponse(
+            url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=success",
+            status_code=303
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to forward email: {str(e)}")
+        message = f"Failed to forward email: {str(e)}"
+        return RedirectResponse(
+            url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=error",
+            status_code=303
+        )
 
 
 @app.get("/api/inbox/{inbox_name}/emails")
@@ -392,38 +506,70 @@ async def health_check():
     return {"status": "healthy", "service": "disposable-email"}
 
 
+async def fetch_resend_email_content(resend_email_id: str) -> dict:
+    """Fetch full email content from Resend API using received email ID"""
+    import httpx
+
+    if not RESEND_API_KEY:
+        print("WARNING: RESEND_API_KEY not set, cannot fetch email content")
+        return {}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # Use the correct endpoint for received emails
+            response = await client.get(
+                f"https://api.resend.com/emails/receiving/{resend_email_id}",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"}
+            )
+            response.raise_for_status()
+            data = response.json()
+            print(f"✓ Fetched email content from Resend API: {resend_email_id}")
+            return data
+    except Exception as e:
+        print(f"✗ Failed to fetch email content from Resend: {e}")
+        return {}
+
+
 @app.post("/api/webhooks/resend")
 async def resend_webhook(request: Request):
     """Receive inbound emails from Resend"""
     try:
         payload = await request.json()
 
-        # Verify webhook secret if configured
-        # Note: Resend doesn't have built-in webhook signature verification yet,
-        # but you can add a simple secret check in the URL or header
+        # Resend webhook payload structure: {"type": "email.received", "data": {...}}
+        email_data_payload = payload.get("data", payload)  # Support both wrapped and unwrapped
 
-        # Extract email data from Resend payload
-        # Resend inbound webhook format:
-        # {
-        #   "from": "sender@example.com",
-        #   "to": ["inbox@yourdomain.com"],
-        #   "subject": "Email subject",
-        #   "text": "Plain text body",
-        #   "html": "<html>HTML body</html>",
-        #   "attachments": [...]
-        # }
+        from_address = email_data_payload.get("from", "")
+        to_addresses = email_data_payload.get("to", [])
+        subject = email_data_payload.get("subject", "")
+        resend_email_id = email_data_payload.get("email_id", "")
 
-        from_address = payload.get("from", "")
-        to_addresses = payload.get("to", [])
-        subject = payload.get("subject", "")
-        body = payload.get("text", "")
-        html_body = payload.get("html", None)
+        # Debug logging
+        print(f"DEBUG - Resend webhook received:")
+        print(f"  webhook type: {payload.get('type', 'unknown')}")
+        print(f"  to_addresses: {to_addresses}")
+        print(f"  from: {from_address}")
+        print(f"  subject: {subject}")
+        print(f"  resend_email_id: {resend_email_id}")
 
         # Extract inbox from first to_address
         inbox = "unknown"
         if to_addresses and len(to_addresses) > 0:
             to_address = to_addresses[0]
             inbox = to_address.split("@")[0].lower() if "@" in to_address else to_address.lower()
+            print(f"  extracted inbox: {inbox}")
+        else:
+            print(f"  WARNING: Could not extract inbox from to_addresses")
+
+        # Fetch full email content from Resend API
+        body = ""
+        html_body = None
+        if resend_email_id:
+            email_content = await fetch_resend_email_content(resend_email_id)
+            body = email_content.get("text", "")
+            html_body = email_content.get("html", None)
+            print(f"  fetched body length: {len(body)}")
+            print(f"  fetched html length: {len(html_body) if html_body else 0}")
 
         # Create email record
         email_id = str(uuid.uuid4())
@@ -436,7 +582,8 @@ async def resend_webhook(request: Request):
             "html_body": html_body,
             "received_at": datetime.now(),
             "forwarded": False,
-            "source": "resend",  # Track that it came via Resend
+            "source": "resend",
+            "resend_email_id": resend_email_id,
         }
 
         # Store email
@@ -697,6 +844,13 @@ function goToInbox(event) {
 
 <div class="container">
     <a href="/inbox/{{ inbox }}" class="btn" style="margin-bottom: 20px;">← Back to Inbox</a>
+
+    <!-- Alert Messages -->
+    {% if message %}
+    <div class="alert alert-{{ 'warning' if message_type == 'error' else message_type }}">
+        {{ message }}
+    </div>
+    {% endif %}
 
     <div class="card">
         <h2>{{ email.subject or "(No Subject)" }}</h2>
