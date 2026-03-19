@@ -87,6 +87,7 @@ IS_PRODUCTION = os.getenv("RAILWAY_ENVIRONMENT") == "production" or os.getenv("P
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
 RESEND_DOMAIN = os.getenv("RESEND_DOMAIN", DOMAIN)  # Domain configured in Resend
+RESEND_VERIFICATION_SENDER = os.getenv("RESEND_VERIFICATION_SENDER", "onboarding@resend.dev")  # Sender for verification emails
 
 # Data storage (in-memory with simple persistence)
 # In production, use Redis or a proper database
@@ -319,10 +320,8 @@ This code expires in 15 minutes.
 If you didn't request this, please ignore this email.
 """
 
-        # Use a generic sender that works with Resend
-        # For testing, use the default Resend onboarding address
-        # For production, this should be a verified domain
-        sender = "onboarding@resend.dev"
+        # Use configured sender or default to Resend's onboarding address
+        sender = RESEND_VERIFICATION_SENDER
 
         params = {
             "from": sender,
