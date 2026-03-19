@@ -1,0 +1,17 @@
+{
+    "created_at": "2026-03-19T01:00:11.000Z",
+    "data": {
+      "attachments": [],
+      "bcc": [],
+      "cc": [],
+      "created_at": "2026-03-19T01:00:13.490Z",
+      "email_id": "56eda078-57fc-468c-aec7-765020da2c83",
+      "from": "noreply@sendtestemail.com",
+      "message_id": "<20260319010011.97F45300012F@mail.sendtestemail.com>",
+      "subject": "SendTestEmail.com - Testing Email ID: 947c32101357d0f041acd1e4a6824d71",
+      "to": [
+        "jane.doe@mailinator2.ihap.uk"
+      ]
+    },
+    "type": "email.received"
+  }

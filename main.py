@@ -495,38 +495,70 @@ async def health_check():
     return {"status": "healthy", "service": "disposable-email"}
 
 
+async def fetch_resend_email_content(resend_email_id: str) -> dict:
+    """Fetch full email content from Resend API using received email ID"""
+    import httpx
+
+    if not RESEND_API_KEY:
+        print("WARNING: RESEND_API_KEY not set, cannot fetch email content")
+        return {}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # Use the correct endpoint for received emails
+            response = await client.get(
+                f"https://api.resend.com/emails/receiving/{resend_email_id}",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"}
+            )
+            response.raise_for_status()
+            data = response.json()
+            print(f"✓ Fetched email content from Resend API: {resend_email_id}")
+            return data
+    except Exception as e:
+        print(f"✗ Failed to fetch email content from Resend: {e}")
+        return {}
+
+
 @app.post("/api/webhooks/resend")
 async def resend_webhook(request: Request):
     """Receive inbound emails from Resend"""
     try:
         payload = await request.json()
 
-        # Verify webhook secret if configured
-        # Note: Resend doesn't have built-in webhook signature verification yet,
-        # but you can add a simple secret check in the URL or header
+        # Resend webhook payload structure: {"type": "email.received", "data": {...}}
+        email_data_payload = payload.get("data", payload)  # Support both wrapped and unwrapped
 
-        # Extract email data from Resend payload
-        # Resend inbound webhook format:
-        # {
-        #   "from": "sender@example.com",
-        #   "to": ["inbox@yourdomain.com"],
-        #   "subject": "Email subject",
-        #   "text": "Plain text body",
-        #   "html": "<html>HTML body</html>",
-        #   "attachments": [...]
-        # }
+        from_address = email_data_payload.get("from", "")
+        to_addresses = email_data_payload.get("to", [])
+        subject = email_data_payload.get("subject", "")
+        resend_email_id = email_data_payload.get("email_id", "")
 
-        from_address = payload.get("from", "")
-        to_addresses = payload.get("to", [])
-        subject = payload.get("subject", "")
-        body = payload.get("text", "")
-        html_body = payload.get("html", None)
+        # Debug logging
+        print(f"DEBUG - Resend webhook received:")
+        print(f"  webhook type: {payload.get('type', 'unknown')}")
+        print(f"  to_addresses: {to_addresses}")
+        print(f"  from: {from_address}")
+        print(f"  subject: {subject}")
+        print(f"  resend_email_id: {resend_email_id}")
 
         # Extract inbox from first to_address
         inbox = "unknown"
         if to_addresses and len(to_addresses) > 0:
             to_address = to_addresses[0]
             inbox = to_address.split("@")[0].lower() if "@" in to_address else to_address.lower()
+            print(f"  extracted inbox: {inbox}")
+        else:
+            print(f"  WARNING: Could not extract inbox from to_addresses")
+
+        # Fetch full email content from Resend API
+        body = ""
+        html_body = None
+        if resend_email_id:
+            email_content = await fetch_resend_email_content(resend_email_id)
+            body = email_content.get("text", "")
+            html_body = email_content.get("html", None)
+            print(f"  fetched body length: {len(body)}")
+            print(f"  fetched html length: {len(html_body) if html_body else 0}")
 
         # Create email record
         email_id = str(uuid.uuid4())
@@ -539,7 +571,8 @@ async def resend_webhook(request: Request):
             "html_body": html_body,
             "received_at": datetime.now(),
             "forwarded": False,
-            "source": "resend",  # Track that it came via Resend
+            "source": "resend",
+            "resend_email_id": resend_email_id,
         }
 
         # Store email
