@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from email.message import EmailMessage as StdEmailMessage
 from typing import Optional
+import html
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP
@@ -19,6 +20,7 @@ from fastapi import FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, EmailStr
+from starlette.datastructures import URL
 
 # Load environment variables from .env file
 load_dotenv()
@@ -213,7 +215,7 @@ async def view_email(
     inbox_name: str,
     email_id: str,
     message: str = "",
-    type: str = "info"
+    message_type: str = "info",
 ):
     """View a single email"""
     inbox = inbox_name.lower()
@@ -222,6 +224,10 @@ async def view_email(
 
     if not email_data:
         raise HTTPException(status_code=404, detail="Email not found")
+
+    # Preserve backward compatibility for legacy `?type=` query parameter
+    if "type" in request.query_params and message_type == "info":
+        message_type = request.query_params["type"]
 
     # Check if there's a pending forward request for this email
     request_key = f"{inbox}:{email_id}"
@@ -236,7 +242,7 @@ async def view_email(
             "domain": DOMAIN,
             "forward_request": forward_request,
             "message": message,
-            "message_type": type,
+            "message_type": message_type,
         },
     )
 
@@ -264,6 +270,7 @@ async def send_verification_email(target_email: str, code: str, email_subject: s
         resend.api_key = RESEND_API_KEY
 
         # Build email content
+        safe_subject = html.escape(email_subject) if email_subject else "(No Subject)"
         html_content = f"""
         <html>
             <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
@@ -274,7 +281,7 @@ async def send_verification_email(target_email: str, code: str, email_subject: s
 
                     <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
                         <p style="margin: 0; font-size: 14px; color: #666;">Original email subject:</p>
-                        <p style="margin: 5px 0 0 0; font-weight: bold;">{email_subject or "(No Subject)"}</p>
+                        <p style="margin: 5px 0 0 0; font-weight: bold;">{safe_subject}</p>
                     </div>
 
                     <p>Enter this verification code to complete the forwarding:</p>
@@ -358,8 +365,12 @@ async def request_email_forward(inbox_name: str, email_id: str, target_email: st
 
     # Redirect back to email view with success message
     message = f"A verification code has been sent to {target_email}. Please check your inbox and enter the code below."
+    redirect_url = URL(f"/inbox/{inbox}/email/{email_id}").include_query_params(
+        message=message,
+        type="success",
+    )
     return RedirectResponse(
-        url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=success",
+        url=str(redirect_url),
         status_code=303
     )
 
@@ -836,7 +847,7 @@ function goToInbox(event) {
 
     <!-- Alert Messages -->
     {% if message %}
-    <div class="alert alert-{{ message_type }}">
+    <div class="alert alert-{{ 'warning' if message_type == 'error' else message_type }}">
         {{ message }}
     </div>
     {% endif %}
