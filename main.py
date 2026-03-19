@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage as StdEmailMessage
 from typing import Optional
 import html
+import logging
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP
@@ -370,8 +371,21 @@ async def request_email_forward(inbox_name: str, email_id: str, target_email: st
     success, error_msg = await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
 
     if not success:
-        # Show error message if sending failed
-        message = f"Failed to send verification email: {error_msg}"
+        # Clean up the stored forward request on failure to avoid stale verification codes
+        if request_key in forward_requests:
+            del forward_requests[request_key]
+        # Log detailed error and show a generic message if sending failed
+        correlation_id = str(uuid.uuid4())
+        logging.error(
+            "Failed to send verification email (correlation_id=%s): %s",
+            correlation_id,
+            error_msg,
+        )
+        message = (
+            "Failed to send verification email. "
+            "Please try again later or contact support with this code: "
+            f"{correlation_id}"
+        )
         redirect_url = URL(f"/inbox/{inbox}/email/{email_id}").include_query_params(
             message=message,
             type="error",
