@@ -26,19 +26,19 @@ from starlette.datastructures import URL
 # Load environment variables from .env file
 load_dotenv()
 
-async def send_forward_email(target_email: str, email_data: dict, inbox: str):
-    """Send the forwarded email to the target address"""
-    import aiosmtplib
+async def send_forward_email(target_email: str, email_data: dict, inbox: str) -> tuple[bool, str]:
+    """Send the forwarded email to the target address using Resend"""
+    import resend
 
-    # Create forwarded email
-    msg = StdEmailMessage()
-    msg["From"] = f"forwarder@{DOMAIN}"
-    msg["To"] = target_email
-    msg["Subject"] = f"[Forwarded from {inbox}@{DOMAIN}] {email_data['subject']}"
+    if not RESEND_API_KEY:
+        print("WARNING: RESEND_API_KEY not set, cannot forward email")
+        return False, "RESEND_API_KEY not configured"
 
-    # Build body with notice
-    forward_notice = f"""
----
+    try:
+        resend.api_key = RESEND_API_KEY
+
+        # Build forward notice
+        forward_notice_text = f"""---
 This email was forwarded from disposable inbox: {inbox}@{DOMAIN}
 Original sender: {email_data['from_address']}
 Original recipient: {email_data['to_address']}
@@ -47,28 +47,60 @@ Received: {email_data['received_at'].strftime('%Y-%m-%d %H:%M:%S')}
 
 """
 
-    if email_data.get("html_body"):
-        msg.add_alternative(
-            f"<html><body><p><em>{forward_notice.replace(chr(10), '<br>')}</em></p>{email_data['html_body']}</body></html>",
-            subtype="html",
-        )
-    else:
-        msg.set_content(forward_notice + email_data["body"])
+        # Build HTML forward notice
+        forward_notice_html = f"""<div style="background: #f5f5f5; padding: 15px; border-left: 4px solid #667eea; margin: 20px 0; font-size: 14px; color: #666;">
+<p style="margin: 0;"><strong>Forwarded from:</strong> {inbox}@{DOMAIN}</p>
+<p style="margin: 5px 0 0 0;"><strong>Original sender:</strong> {email_data['from_address']}</p>
+<p style="margin: 5px 0 0 0;"><strong>Original recipient:</strong> {email_data['to_address']}</p>
+<p style="margin: 5px 0 0 0;"><strong>Received:</strong> {email_data['received_at'].strftime('%Y-%m-%d %H:%M:%S')}</p>
+</div>
+<hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+"""
 
-    # Send via local SMTP (you'd configure your SMTP server here)
-    # For now, just log it - configure with your SMTP credentials
-    print(f"Would forward to {target_email}:")
-    print(f"Subject: {msg['Subject']}")
+        # Build email content
+        original_subject = email_data.get('subject', '(No Subject)')
+        safe_subject = html.escape(original_subject)
 
-    # Example with aiosmtplib (configure with your SMTP server):
-    # await aiosmtplib.send(
-    #     msg,
-    #     hostname="smtp.gmail.com",
-    #     port=587,
-    #     username="your-email@gmail.com",
-    #     password="your-password",
-    #     start_tls=True,
-    # )
+        # Plain text content
+        text_content = forward_notice_text + email_data.get('body', '')
+
+        # HTML content
+        if email_data.get("html_body"):
+            html_content = forward_notice_html + email_data['html_body']
+        else:
+            # Convert plain text to HTML
+            body_html = html.escape(email_data.get('body', '')).replace('\n', '<br>')
+            html_content = forward_notice_html + f"<p>{body_html}</p>"
+
+        # Full HTML wrapper
+        full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forwarded Email</title>
+</head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px;">
+    {html_content}
+</body>
+</html>"""
+
+        params = {
+            "from": RESEND_VERIFICATION_SENDER,
+            "to": [target_email],
+            "subject": f"[Forwarded from {inbox}@{DOMAIN}] {original_subject}",
+            "html": full_html,
+            "text": text_content,
+        }
+
+        result = resend.Emails.send(params)
+        print(f"✓ Forwarded email sent to {target_email}: {result}")
+        return True, ""
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"✗ Failed to forward email: {error_msg}")
+        return False, error_msg
 
 
 # Configuration
@@ -457,8 +489,9 @@ async def verify_and_forward_email(
         )
 
     # Forward the email
-    try:
-        await send_forward_email(target_email, email_data, inbox)
+    success, error_msg = await send_forward_email(target_email, email_data, inbox)
+
+    if success:
         email_data["forwarded"] = True
 
         # Clean up the request
@@ -470,8 +503,10 @@ async def verify_and_forward_email(
             url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=success",
             status_code=303
         )
-    except Exception as e:
-        message = f"Failed to forward email: {str(e)}"
+    else:
+        # Forward failed - show error but keep the verification request
+        # so user can retry without re-verifying
+        message = f"Failed to forward email: {error_msg}"
         return RedirectResponse(
             url=f"/inbox/{inbox}/email/{email_id}?message={message}&type=error",
             status_code=303
