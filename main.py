@@ -253,8 +253,8 @@ def generate_verification_code() -> str:
     return ''.join(random.choices('0123456789', k=6))
 
 
-async def send_verification_email(target_email: str, code: str, email_subject: str):
-    """Send verification code to target email via Resend"""
+async def send_verification_email(target_email: str, code: str, email_subject: str) -> tuple[bool, str]:
+    """Send verification code to target email via Resend. Returns (success, error_message)."""
     import resend
 
     if not RESEND_API_KEY:
@@ -264,7 +264,7 @@ async def send_verification_email(target_email: str, code: str, email_subject: s
         print(f"Code: {code}")
         print(f"Email Subject: {email_subject}")
         print(f"{'='*60}\n")
-        return
+        return True, ""
 
     try:
         resend.api_key = RESEND_API_KEY
@@ -319,8 +319,13 @@ This code expires in 15 minutes.
 If you didn't request this, please ignore this email.
 """
 
+        # Use a generic sender that works with Resend
+        # For testing, use the default Resend onboarding address
+        # For production, this should be a verified domain
+        sender = "onboarding@resend.dev"
+
         params = {
-            "from": f"verify@{RESEND_DOMAIN}",
+            "from": sender,
             "to": [target_email],
             "subject": f"Verification Code: {code}",
             "html": html_content,
@@ -329,10 +334,12 @@ If you didn't request this, please ignore this email.
 
         result = resend.Emails.send(params)
         print(f"✓ Verification email sent to {target_email}: {result}")
+        return True, ""
 
     except Exception as e:
-        print(f"✗ Failed to send verification email: {e}")
-        # Don't raise - let the user know in the UI that email sending failed
+        error_msg = str(e)
+        print(f"✗ Failed to send verification email: {error_msg}")
+        return False, error_msg
 
 
 @app.post("/api/inbox/{inbox_name}/email/{email_id}/forward-request")
@@ -361,7 +368,19 @@ async def request_email_forward(inbox_name: str, email_id: str, target_email: st
     }
 
     # Send verification code via email
-    await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
+    success, error_msg = await send_verification_email(target_email, verification_code, email_data.get("subject", "(No Subject)"))
+
+    if not success:
+        # Show error message if sending failed
+        message = f"Failed to send verification email: {error_msg}"
+        redirect_url = URL(f"/inbox/{inbox}/email/{email_id}").include_query_params(
+            message=message,
+            type="error",
+        )
+        return RedirectResponse(
+            url=str(redirect_url),
+            status_code=303
+        )
 
     # Redirect back to email view with success message
     message = f"A verification code has been sent to {target_email}. Please check your inbox and enter the code below."
